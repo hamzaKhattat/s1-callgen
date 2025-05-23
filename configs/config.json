@@ -1,0 +1,22 @@
+{
+    "s2_server": {
+        "host": "10.0.0.2",
+        "port": 8000,
+        "protocol": "http"
+    },
+    "asterisk": {
+        "ami": {
+            "host": "localhost",
+            "port": 5038,
+            "username": "admin",
+            "password": "admin"
+        }
+    },
+    "database": {
+        "host": "localhost",
+        "port": 3306,
+        "username": "root",
+        "password": "temppass",
+        "name": "call_routing"
+    }
+}
