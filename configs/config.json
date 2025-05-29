@@ -7,12 +7,16 @@
        "acd_min": 30,
        "acd_max": 180,
        "asr": 70.0,
+       "min_concurrent": 10,
        "max_concurrent": 100,
-       "calls_per_second": 1.0,
-       "ramp_up_time": 60,
-       "ramp_down_time": 60
+       "calls_per_second": 2.0,
+       "ramp_up_time": 300,
+       "ramp_down_time": 300,
+       "ramp_up_rate": 10,
+       "ramp_down_rate": 10
    },
    "schedule": {
+       "enabled": true,
        "weekday": {
            "start_hour": 8,
            "end_hour": 18
@@ -20,6 +24,20 @@
        "weekend": {
            "start_hour": 10,
            "end_hour": 14
+       }
+   },
+   "autopilot": {
+       "enabled": false,
+       "target_asr": 70.0,
+       "adjustment_interval": 60,
+       "max_cps_adjustment": 0.5
+   },
+   "web_interface": {
+       "enabled": true,
+       "port": 8080,
+       "auth": {
+           "username": "admin",
+           "password": "admin"
        }
    }
 }

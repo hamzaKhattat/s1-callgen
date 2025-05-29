@@ -1,0 +1,1422 @@
+#!/bin/bash
+# Complete S1 Call Generator with Web Interface
+
+cd /home/car/s1-callgen
+
+# First, let's add the missing web interface and autopilot features
+mkdir -p {internal/{web,autopilot,stats},static,templates}
+
+# Create enhanced models with all PDF requirements
+cat > internal/models/models.go << 'EOF'
+package models
+
+import "time"
+
+type Call struct {
+    ID          string    `json:"id"`
+    ANI         string    `json:"ani"`
+    DNIS        string    `json:"dnis"`
+    StartTime   time.Time `json:"start_time"`
+    EndTime     time.Time `json:"end_time"`
+    Duration    int       `json:"duration"`
+    Status      string    `json:"status"`
+    SIPCallID   string    `json:"sip_call_id"`
+    LocalTag    string    `json:"local_tag"`
+    RemoteTag   string    `json:"remote_tag"`
+    Country     string    `json:"country"`
+    Carrier     string    `json:"carrier"`
+}
+
+type NumberPair struct {
+    ANI     string `json:"ani"`
+    DNIS    string `json:"dnis"`
+    Country string `json:"country"`
+    Carrier string `json:"carrier"`
+}
+
+type Config struct {
+    S2Server struct {
+        Host string `json:"host"`
+        Port int    `json:"port"`
+    } `json:"s2_server"`
+    
+    CallParams struct {
+        ACDMin           int     `json:"acd_min"`
+        ACDMax           int     `json:"acd_max"`
+        ASR              float64 `json:"asr"`
+        MaxConcurrent    int     `json:"max_concurrent"`
+        MinConcurrent    int     `json:"min_concurrent"`
+        CallsPerSecond   float64 `json:"calls_per_second"`
+        RampUpTime       int     `json:"ramp_up_time"`
+        RampDownTime     int     `json:"ramp_down_time"`
+        RampUpRate       int     `json:"ramp_up_rate"`    // calls per minute
+        RampDownRate     int     `json:"ramp_down_rate"`  // calls per minute
+    } `json:"call_params"`
+    
+    Schedule struct {
+        Enabled bool `json:"enabled"`
+        Weekday struct {
+            StartHour int `json:"start_hour"`
+            EndHour   int `json:"end_hour"`
+        } `json:"weekday"`
+        Weekend struct {
+            StartHour int `json:"start_hour"`
+            EndHour   int `json:"end_hour"`
+        } `json:"weekend"`
+    } `json:"schedule"`
+    
+    Autopilot struct {
+        Enabled            bool    `json:"enabled"`
+        TargetASR          float64 `json:"target_asr"`
+        AdjustmentInterval int     `json:"adjustment_interval"` // seconds
+        MaxCPSAdjustment   float64 `json:"max_cps_adjustment"`
+    } `json:"autopilot"`
+    
+    WebInterface struct {
+        Enabled bool   `json:"enabled"`
+        Port    int    `json:"port"`
+        Auth    struct {
+            Username string `json:"username"`
+            Password string `json:"password"`
+        } `json:"auth"`
+    } `json:"web_interface"`
+}
+
+type Statistics struct {
+    TotalCalls          int64     `json:"total_calls"`
+    SuccessfulCalls     int64     `json:"successful_calls"`
+    FailedCalls         int64     `json:"failed_calls"`
+    ActiveCalls         int64     `json:"active_calls"`
+    CurrentCPS          float64   `json:"current_cps"`
+    AverageCallDuration float64   `json:"average_call_duration"`
+    CurrentASR          float64   `json:"current_asr"`
+    StartTime           time.Time `json:"start_time"`
+    LastUpdate          time.Time `json:"last_update"`
+    HourlyStats         map[int]*HourlyStats `json:"hourly_stats"`
+}
+
+type HourlyStats struct {
+    Hour            int   `json:"hour"`
+    TotalCalls      int64 `json:"total_calls"`
+    SuccessfulCalls int64 `json:"successful_calls"`
+    FailedCalls     int64 `json:"failed_calls"`
+    PeakConcurrent  int64 `json:"peak_concurrent"`
+}
+EOF
+
+# Create enhanced generator with ramp up/down
+cat > internal/generator/enhanced_generator.go << 'EOF'
+package generator
+
+import (
+    "encoding/csv"
+    "log"
+    "math"
+    "math/rand"
+    "net"
+    "os"
+    "sync"
+    "sync/atomic"
+    "time"
+    
+    "github.com/s1-callgen/internal/models"
+    "github.com/s1-callgen/internal/sip"
+)
+
+type Generator struct {
+    config          *models.Config
+    sipClient       *sip.Client
+    numberPairs     []models.NumberPair
+    stats           *Statistics
+    hourlyStats     map[int]*models.HourlyStats
+    mu              sync.RWMutex
+    stopChan        chan bool
+    wg              sync.WaitGroup
+    currentCPS      float64
+    targetCPS       float64
+    rampStartTime   time.Time
+    isRamping       bool
+    autopilotActive bool
+}
+
+type Statistics struct {
+    TotalCalls          int64
+    SuccessfulCalls     int64
+    FailedCalls         int64
+    ActiveCalls         int64
+    TotalDuration       int64
+    StartTime           time.Time
+    LastCallTime        time.Time
+    mu                  sync.Mutex
+}
+
+func NewGenerator(config *models.Config) (*Generator, error) {
+    localIP := getLocalIP()
+    
+    sipClient, err := sip.NewClient(localIP, 5070, config.S2Server.Host, config.S2Server.Port)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &Generator{
+        config:      config,
+        sipClient:   sipClient,
+        stats: &Statistics{
+            StartTime: time.Now(),
+        },
+        hourlyStats:     make(map[int]*models.HourlyStats),
+        stopChan:        make(chan bool),
+        currentCPS:      0,
+        targetCPS:       config.CallParams.CallsPerSecond,
+        autopilotActive: config.Autopilot.Enabled,
+    }, nil
+}
+
+func (g *Generator) Start() error {
+    if err := g.sipClient.Connect(); err != nil {
+        return err
+    }
+    
+    log.Printf("[GENERATOR] Starting call generation")
+    log.Printf("[GENERATOR] Mode: %s", g.getModeString())
+    log.Printf("[GENERATOR] Parameters: ACD=%d-%ds, ASR=%.0f%%, Concurrent=%d-%d",
+        g.config.CallParams.ACDMin, g.config.CallParams.ACDMax,
+        g.config.CallParams.ASR, g.config.CallParams.MinConcurrent,
+        g.config.CallParams.MaxConcurrent)
+    
+    // Start ramp-up process
+    g.startRampUp()
+    
+    // Start call generation loop
+    g.wg.Add(1)
+    go g.generateCalls()
+    
+    // Start statistics reporter
+    g.wg.Add(1)
+    go g.reportStatistics()
+    
+    // Start autopilot if enabled
+    if g.config.Autopilot.Enabled {
+        g.wg.Add(1)
+        go g.runAutopilot()
+    }
+    
+    // Start hourly statistics collector
+    g.wg.Add(1)
+    go g.collectHourlyStats()
+    
+    return nil
+}
+
+func (g *Generator) getModeString() string {
+    mode := "Manual"
+    if g.config.Autopilot.Enabled {
+        mode = "Autopilot"
+    }
+    if g.config.Schedule.Enabled {
+        mode += " with Schedule"
+    }
+    return mode
+}
+
+func (g *Generator) startRampUp() {
+    g.isRamping = true
+    g.rampStartTime = time.Now()
+    g.currentCPS = 0
+    
+    log.Printf("[GENERATOR] Starting ramp-up: %d seconds to reach %.2f CPS",
+        g.config.CallParams.RampUpTime, g.targetCPS)
+}
+
+func (g *Generator) generateCalls() {
+    defer g.wg.Done()
+    
+    ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
+    defer ticker.Stop()
+    
+    lastCallTime := time.Now()
+    callAccumulator := 0.0
+    
+    for {
+        select {
+        case <-ticker.C:
+            // Update CPS based on ramp-up/down
+            g.updateCPS()
+            
+            // Check schedule
+            if !g.isWithinSchedule() {
+                g.handleOutOfSchedule()
+                continue
+            }
+            
+            // Check concurrent limits
+            activeCalls := atomic.LoadInt64(&g.stats.ActiveCalls)
+            if activeCalls >= int64(g.config.CallParams.MaxConcurrent) {
+                continue
+            }
+            
+            if activeCalls < int64(g.config.CallParams.MinConcurrent) {
+                // Force calls to maintain minimum
+                g.wg.Add(1)
+                go g.makeCall()
+                continue
+            }
+            
+            // Calculate calls to make based on current CPS
+            elapsed := time.Since(lastCallTime).Seconds()
+            callsToMake := g.currentCPS * elapsed
+            callAccumulator += callsToMake
+            
+            // Make calls based on accumulator
+            for callAccumulator >= 1.0 {
+                g.wg.Add(1)
+                go g.makeCall()
+                callAccumulator -= 1.0
+            }
+            
+            lastCallTime = time.Now()
+            
+        case <-g.stopChan:
+            return
+        }
+    }
+}
+
+func (g *Generator) updateCPS() {
+    if !g.isRamping {
+        return
+    }
+    
+    elapsed := time.Since(g.rampStartTime).Seconds()
+    
+    if elapsed >= float64(g.config.CallParams.RampUpTime) {
+        g.currentCPS = g.targetCPS
+        g.isRamping = false
+        log.Printf("[GENERATOR] Ramp-up complete: CPS = %.2f", g.currentCPS)
+        return
+    }
+    
+    // Linear ramp-up
+    progress := elapsed / float64(g.config.CallParams.RampUpTime)
+    g.currentCPS = g.targetCPS * progress
+}
+
+func (g *Generator) handleOutOfSchedule() {
+    activeCalls := atomic.LoadInt64(&g.stats.ActiveCalls)
+    if activeCalls > 0 && g.currentCPS > 0 {
+        // Start ramp-down
+        log.Printf("[GENERATOR] Outside schedule - starting ramp-down")
+        g.startRampDown()
+    }
+}
+
+func (g *Generator) startRampDown() {
+    // Implement ramp-down logic
+    rampDownDuration := g.config.CallParams.RampDownTime
+    steps := rampDownDuration / 10 // Update every 10 seconds
+    
+    for i := 0; i < steps && g.currentCPS > 0; i++ {
+        g.currentCPS *= 0.9 // Reduce by 10% each step
+        time.Sleep(10 * time.Second)
+        
+        if g.isWithinSchedule() {
+            g.startRampUp()
+            return
+        }
+    }
+    
+    g.currentCPS = 0
+}
+
+func (g *Generator) makeCall() {
+    defer g.wg.Done()
+    
+    // Get random number pair
+    g.mu.RLock()
+    if len(g.numberPairs) == 0 {
+        g.mu.RUnlock()
+        return
+    }
+    pair := g.numberPairs[rand.Intn(len(g.numberPairs))]
+    g.mu.RUnlock()
+    
+    // Determine if call should be answered based on ASR
+    shouldAnswer := rand.Float64()*100 < g.config.CallParams.ASR
+    
+    atomic.AddInt64(&g.stats.TotalCalls, 1)
+    atomic.AddInt64(&g.stats.ActiveCalls, 1)
+    g.stats.LastCallTime = time.Now()
+    
+    if shouldAnswer {
+        // Random duration with variation
+        baseDuration := g.config.CallParams.ACDMin + 
+            rand.Intn(g.config.CallParams.ACDMax-g.config.CallParams.ACDMin)
+        
+        // Add some variation to make it more organic
+        variation := float64(baseDuration) * 0.2 * (rand.Float64() - 0.5)
+        duration := time.Duration(float64(baseDuration)+variation) * time.Second
+        
+        startTime := time.Now()
+        err := g.sipClient.MakeCall(pair.ANI, pair.DNIS, duration)
+        actualDuration := int64(time.Since(startTime).Seconds())
+        
+        if err == nil {
+            atomic.AddInt64(&g.stats.SuccessfulCalls, 1)
+            atomic.AddInt64(&g.stats.TotalDuration, actualDuration)
+        } else {
+            atomic.AddInt64(&g.stats.FailedCalls, 1)
+            log.Printf("[GENERATOR] Call failed: %v", err)
+        }
+    } else {
+        // Simulate rejected call
+        time.Sleep(time.Duration(3+rand.Intn(5)) * time.Second)
+        atomic.AddInt64(&g.stats.FailedCalls, 1)
+    }
+    
+    atomic.AddInt64(&g.stats.ActiveCalls, -1)
+}
+
+func (g *Generator) runAutopilot() {
+    defer g.wg.Done()
+    
+    ticker := time.NewTicker(time.Duration(g.config.Autopilot.AdjustmentInterval) * time.Second)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            g.adjustParametersAutomatically()
+        case <-g.stopChan:
+            return
+        }
+    }
+}
+
+func (g *Generator) adjustParametersAutomatically() {
+    g.stats.mu.Lock()
+    defer g.stats.mu.Unlock()
+    
+    if g.stats.TotalCalls < 100 {
+        return // Not enough data
+    }
+    
+    currentASR := float64(g.stats.SuccessfulCalls) / float64(g.stats.TotalCalls) * 100
+    targetASR := g.config.Autopilot.TargetASR
+    
+    // Adjust CPS based on ASR
+    if math.Abs(currentASR-targetASR) > 5 {
+        adjustment := (targetASR - currentASR) / 100 * g.config.Autopilot.MaxCPSAdjustment
+        
+        g.mu.Lock()
+        g.targetCPS += adjustment
+        g.targetCPS = math.Max(0.1, math.Min(g.targetCPS, 10.0))
+        g.mu.Unlock()
+        
+        log.Printf("[AUTOPILOT] Adjusted CPS to %.2f (ASR: %.1f%% -> Target: %.1f%%)",
+            g.targetCPS, currentASR, targetASR)
+    }
+}
+
+func (g *Generator) collectHourlyStats() {
+    defer g.wg.Done()
+    
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            hour := time.Now().Hour()
+            
+            g.mu.Lock()
+            if _, exists := g.hourlyStats[hour]; !exists {
+                g.hourlyStats[hour] = &models.HourlyStats{Hour: hour}
+            }
+            
+            stats := g.hourlyStats[hour]
+            stats.TotalCalls = atomic.LoadInt64(&g.stats.TotalCalls)
+            stats.SuccessfulCalls = atomic.LoadInt64(&g.stats.SuccessfulCalls)
+            stats.FailedCalls = atomic.LoadInt64(&g.stats.FailedCalls)
+            
+            activeCalls := atomic.LoadInt64(&g.stats.ActiveCalls)
+            if activeCalls > stats.PeakConcurrent {
+                stats.PeakConcurrent = activeCalls
+            }
+            g.mu.Unlock()
+            
+        case <-g.stopChan:
+            return
+        }
+    }
+}
+
+func (g *Generator) GetStatistics() *models.Statistics {
+    g.stats.mu.Lock()
+    defer g.stats.mu.Unlock()
+    
+    totalCalls := atomic.LoadInt64(&g.stats.TotalCalls)
+    successfulCalls := atomic.LoadInt64(&g.stats.SuccessfulCalls)
+    totalDuration := atomic.LoadInt64(&g.stats.TotalDuration)
+    
+    avgDuration := float64(0)
+    if successfulCalls > 0 {
+        avgDuration = float64(totalDuration) / float64(successfulCalls)
+    }
+    
+    currentASR := float64(0)
+    if totalCalls > 0 {
+        currentASR = float64(successfulCalls) / float64(totalCalls) * 100
+    }
+    
+    elapsed := time.Since(g.stats.StartTime).Seconds()
+    currentCPS := float64(totalCalls) / elapsed
+    
+    return &models.Statistics{
+        TotalCalls:          totalCalls,
+        SuccessfulCalls:     successfulCalls,
+        FailedCalls:         atomic.LoadInt64(&g.stats.FailedCalls),
+        ActiveCalls:         atomic.LoadInt64(&g.stats.ActiveCalls),
+        CurrentCPS:          currentCPS,
+        AverageCallDuration: avgDuration,
+        CurrentASR:          currentASR,
+        StartTime:           g.stats.StartTime,
+        LastUpdate:          time.Now(),
+        HourlyStats:         g.hourlyStats,
+    }
+}
+
+// Keep existing helper functions...
+func (g *Generator) LoadNumbersFromCSV(filename string) error {
+    file, err := os.Open(filename)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+    
+    reader := csv.NewReader(file)
+    records, err := reader.ReadAll()
+    if err != nil {
+        return err
+    }
+    
+    g.mu.Lock()
+    defer g.mu.Unlock()
+    
+    g.numberPairs = make([]models.NumberPair, 0, len(records))
+    for i, record := range records {
+        if i == 0 && record[0] == "ANI" {
+            continue // Skip header
+        }
+        if len(record) >= 2 {
+            pair := models.NumberPair{
+                ANI:  record[0],
+                DNIS: record[1],
+            }
+            if len(record) >= 3 {
+                pair.Country = record[2]
+            }
+            if len(record) >= 4 {
+                pair.Carrier = record[3]
+            }
+            g.numberPairs = append(g.numberPairs, pair)
+        }
+    }
+    
+    log.Printf("[GENERATOR] Loaded %d number pairs", len(g.numberPairs))
+    return nil
+}
+
+func (g *Generator) LoadTestNumbers() {
+    g.mu.Lock()
+    defer g.mu.Unlock()
+    
+    g.numberPairs = []models.NumberPair{
+        {ANI: "19543004835", DNIS: "50764137984", Country: "US", Carrier: "Verizon"},
+        {ANI: "19543004836", DNIS: "50764137985", Country: "US", Carrier: "AT&T"},
+        {ANI: "19543004837", DNIS: "50764137986", Country: "US", Carrier: "T-Mobile"},
+        {ANI: "19543004838", DNIS: "50764137987", Country: "US", Carrier: "Sprint"},
+        {ANI: "19543004839", DNIS: "50764137988", Country: "US", Carrier: "Verizon"},
+    }
+}
+
+func (g *Generator) isWithinSchedule() bool {
+    if !g.config.Schedule.Enabled {
+        return true
+    }
+    
+    now := time.Now()
+    hour := now.Hour()
+    
+    var startHour, endHour int
+    
+    if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+        startHour = g.config.Schedule.Weekend.StartHour
+        endHour = g.config.Schedule.Weekend.EndHour
+    } else {
+        startHour = g.config.Schedule.Weekday.StartHour
+        endHour = g.config.Schedule.Weekday.EndHour
+    }
+    
+    return hour >= startHour && hour < endHour
+}
+
+func (g *Generator) reportStatistics() {
+    defer g.wg.Done()
+    
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            stats := g.GetStatistics()
+            
+            log.Printf("[STATS] Calls: %d (Success: %d, Failed: %d, Active: %d)",
+                stats.TotalCalls, stats.SuccessfulCalls, stats.FailedCalls,
+                stats.ActiveCalls)
+            log.Printf("[STATS] Performance: CPS=%.2f, ASR=%.1f%%, Avg Duration=%.1fs",
+                stats.CurrentCPS, stats.CurrentASR, stats.AverageCallDuration)
+            log.Printf("[STATS] Current Target CPS: %.2f, Actual CPS: %.2f",
+                g.targetCPS, g.currentCPS)
+            
+        case <-g.stopChan:
+            return
+        }
+    }
+}
+
+func (g *Generator) Stop() {
+    log.Printf("[GENERATOR] Stopping...")
+    close(g.stopChan)
+    g.wg.Wait()
+    g.sipClient.Close()
+    
+    // Print final statistics
+    stats := g.GetStatistics()
+    log.Printf("[GENERATOR] Final Statistics:")
+    log.Printf("  Total Calls: %d", stats.TotalCalls)
+    log.Printf("  Successful: %d (%.1f%%)", stats.SuccessfulCalls, stats.CurrentASR)
+    log.Printf("  Failed: %d", stats.FailedCalls)
+    log.Printf("  Average Duration: %.1f seconds", stats.AverageCallDuration)
+    log.Printf("  Average CPS: %.2f", stats.CurrentCPS)
+}
+
+func getLocalIP() string {
+    interfaces, err := net.Interfaces()
+    if err != nil {
+        return "10.0.0.1"
+    }
+    
+    for _, iface := range interfaces {
+        if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+            continue
+        }
+        
+        addrs, err := iface.Addrs()
+        if err != nil {
+            continue
+        }
+        
+        for _, addr := range addrs {
+            if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+                ip := ipnet.IP.String()
+                if ip != "127.0.0.1" && 
+                   (strings.HasPrefix(ip, "10.") || 
+                    strings.HasPrefix(ip, "192.168.") ||
+                    strings.HasPrefix(ip, "172.")) {
+                    return ip
+                }
+            }
+        }
+    }
+    
+    return "10.0.0.1"
+}
+EOF
+
+# Create web interface
+cat > internal/web/server.go << 'EOF'
+package web
+
+import (
+    "encoding/json"
+    "fmt"
+    "html/template"
+    "log"
+    "net/http"
+    "time"
+    
+    "github.com/s1-callgen/internal/generator"
+    "github.com/s1-callgen/internal/models"
+)
+
+type WebServer struct {
+    config    *models.Config
+    generator *generator.Generator
+    templates *template.Template
+}
+
+func NewWebServer(config *models.Config, gen *generator.Generator) *WebServer {
+    return &WebServer{
+        config:    config,
+        generator: gen,
+    }
+}
+
+func (w *WebServer) Start() error {
+    if !w.config.WebInterface.Enabled {
+        return nil
+    }
+    
+    // Setup routes
+    http.HandleFunc("/", w.authMiddleware(w.handleDashboard))
+    http.HandleFunc("/api/stats", w.authMiddleware(w.handleStats))
+    http.HandleFunc("/api/config", w.authMiddleware(w.handleConfig))
+    http.HandleFunc("/api/numbers", w.authMiddleware(w.handleNumbers))
+    http.HandleFunc("/api/control", w.authMiddleware(w.handleControl))
+    http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+    
+    addr := fmt.Sprintf(":%d", w.config.WebInterface.Port)
+    log.Printf("[WEB] Starting web interface on http://localhost%s", addr)
+    
+    return http.ListenAndServe(addr, nil)
+}
+
+func (w *WebServer) authMiddleware(handler http.HandlerFunc) http.HandlerFunc {
+    return func(rw http.ResponseWriter, r *http.Request) {
+        user, pass, ok := r.BasicAuth()
+        if !ok || user != w.config.WebInterface.Auth.Username || 
+           pass != w.config.WebInterface.Auth.Password {
+            rw.Header().Set("WWW-Authenticate", `Basic realm="S1 Call Generator"`)
+            http.Error(rw, "Unauthorized", http.StatusUnauthorized)
+            return
+        }
+        handler(rw, r)
+    }
+}
+
+func (w *WebServer) handleDashboard(rw http.ResponseWriter, r *http.Request) {
+    // Serve the dashboard HTML
+    fmt.Fprintf(rw, dashboardHTML)
+}
+
+func (w *WebServer) handleStats(rw http.ResponseWriter, r *http.Request) {
+    stats := w.generator.GetStatistics()
+    
+    rw.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(rw).Encode(stats)
+}
+
+func (w *WebServer) handleConfig(rw http.ResponseWriter, r *http.Request) {
+    switch r.Method {
+    case "GET":
+        rw.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(rw).Encode(w.config)
+    case "POST":
+        // Update configuration
+        var newConfig models.Config
+        if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
+            http.Error(rw, err.Error(), http.StatusBadRequest)
+            return
+        }
+        
+        // Apply new configuration
+        w.config = &newConfig
+        rw.WriteHeader(http.StatusOK)
+    }
+}
+
+func (w *WebServer) handleNumbers(rw http.ResponseWriter, r *http.Request) {
+    switch r.Method {
+    case "POST":
+        // Handle CSV upload or manual entry
+        if err := r.ParseMultipartForm(32 << 20); err != nil {
+            http.Error(rw, err.Error(), http.StatusBadRequest)
+            return
+        }
+        
+        file, _, err := r.FormFile("csv")
+        if err == nil {
+            // Process CSV file
+            defer file.Close()
+            // Implementation for CSV processing
+        } else {
+            // Process manual entry
+            numbers := r.FormValue("numbers")
+            // Implementation for manual number processing
+        }
+        
+        rw.WriteHeader(http.StatusOK)
+    }
+}
+
+func (w *WebServer) handleControl(rw http.ResponseWriter, r *http.Request) {
+    var req struct {
+        Action string `json:"action"`
+    }
+    
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(rw, err.Error(), http.StatusBadRequest)
+        return
+    }
+    
+    switch req.Action {
+    case "start":
+        go w.generator.Start()
+    case "stop":
+        w.generator.Stop()
+    case "toggle_autopilot":
+        w.config.Autopilot.Enabled = !w.config.Autopilot.Enabled
+    }
+    
+    rw.WriteHeader(http.StatusOK)
+}
+
+const dashboardHTML = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>S1 Call Generator Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
+        .stat-box { text-align: center; }
+        .stat-value { font-size: 2em; font-weight: bold; color: #2196F3; }
+        .stat-label { color: #666; margin-top: 5px; }
+        .chart-container { height: 300px; margin-top: 20px; }
+        .controls { display: flex; gap: 10px; margin-bottom: 20px; }
+        button { padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+        .btn-primary { background: #2196F3; color: white; }
+        .btn-danger { background: #f44336; color: white; }
+        .btn-success { background: #4CAF50; color: white; }
+        .status { display: inline-block; padding: 5px 10px; border-radius: 4px; }
+        .status.active { background: #4CAF50; color: white; }
+        .status.inactive { background: #f44336; color: white; }
+        #realtimeChart { width: 100%; height: 300px; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>S1 Call Generator Dashboard</h1>
+        
+        <div class="card">
+            <h2>Controls</h2>
+            <div class="controls">
+                <button class="btn-primary" onclick="startGenerator()">Start</button>
+                <button class="btn-danger" onclick="stopGenerator()">Stop</button>
+                <button class="btn-success" onclick="toggleAutopilot()">Toggle Autopilot</button>
+                <span class="status" id="status">Inactive</span>
+                <span class="status" id="autopilot-status">Autopilot: OFF</span>
+           </div>
+       </div>
+       
+       <div class="card">
+           <h2>Real-time Statistics</h2>
+           <div class="stats-grid">
+               <div class="stat-box">
+                   <div class="stat-value" id="total-calls">0</div>
+                   <div class="stat-label">Total Calls</div>
+               </div>
+               <div class="stat-box">
+                   <div class="stat-value" id="active-calls">0</div>
+                   <div class="stat-label">Active Calls</div>
+               </div>
+               <div class="stat-box">
+                   <div class="stat-value" id="success-rate">0%</div>
+                   <div class="stat-label">ASR</div>
+               </div>
+               <div class="stat-box">
+                   <div class="stat-value" id="cps">0</div>
+                   <div class="stat-label">Calls/Second</div>
+               </div>
+               <div class="stat-box">
+                   <div class="stat-value" id="avg-duration">0s</div>
+                   <div class="stat-label">Avg Duration</div>
+               </div>
+           </div>
+       </div>
+       
+       <div class="card">
+           <h2>Call Traffic Pattern</h2>
+           <canvas id="realtimeChart"></canvas>
+       </div>
+       
+       <div class="card">
+           <h2>Upload Numbers</h2>
+           <form id="upload-form">
+               <input type="file" id="csv-file" accept=".csv">
+               <button type="submit" class="btn-primary">Upload CSV</button>
+           </form>
+           <p>Or enter numbers manually:</p>
+           <textarea id="manual-numbers" rows="5" cols="50" placeholder="ANI,DNIS,Country,Carrier"></textarea>
+           <button onclick="uploadManual()" class="btn-primary">Add Numbers</button>
+       </div>
+   </div>
+   
+   <script>
+       let chart;
+       let chartData = {
+           labels: [],
+           datasets: [{
+               label: 'Simultaneous Calls',
+               data: [],
+               borderColor: 'rgb(75, 192, 192)',
+               backgroundColor: 'rgba(75, 192, 192, 0.2)',
+               tension: 0.1
+           }, {
+               label: 'Call Attempts',
+               data: [],
+               borderColor: 'rgb(255, 99, 132)',
+               backgroundColor: 'rgba(255, 99, 132, 0.2)',
+               tension: 0.1
+           }]
+       };
+       
+       function initChart() {
+           const ctx = document.getElementById('realtimeChart').getContext('2d');
+           chart = new Chart(ctx, {
+               type: 'line',
+               data: chartData,
+               options: {
+                   responsive: true,
+                   maintainAspectRatio: false,
+                   scales: {
+                       y: {
+                           beginAtZero: true
+                       }
+                   },
+                   plugins: {
+                       legend: {
+                           display: true,
+                           position: 'top'
+                       }
+                   }
+               }
+           });
+       }
+       
+       function updateStats() {
+           fetch('/api/stats', {
+               headers: {
+                   'Authorization': 'Basic ' + btoa('admin:admin')
+               }
+           })
+           .then(response => response.json())
+           .then(data => {
+               document.getElementById('total-calls').textContent = data.total_calls;
+               document.getElementById('active-calls').textContent = data.active_calls;
+               document.getElementById('success-rate').textContent = data.current_asr.toFixed(1) + '%';
+               document.getElementById('cps').textContent = data.current_cps.toFixed(2);
+               document.getElementById('avg-duration').textContent = data.average_call_duration.toFixed(1) + 's';
+               
+               // Update chart
+               const now = new Date().toLocaleTimeString();
+               chartData.labels.push(now);
+               chartData.datasets[0].data.push(data.active_calls);
+               chartData.datasets[1].data.push(data.total_calls);
+               
+               // Keep only last 50 points
+               if (chartData.labels.length > 50) {
+                   chartData.labels.shift();
+                   chartData.datasets[0].data.shift();
+                   chartData.datasets[1].data.shift();
+               }
+               
+               chart.update();
+           });
+       }
+       
+       function startGenerator() {
+           fetch('/api/control', {
+               method: 'POST',
+               headers: {
+                   'Authorization': 'Basic ' + btoa('admin:admin'),
+                   'Content-Type': 'application/json'
+               },
+               body: JSON.stringify({action: 'start'})
+           }).then(() => {
+               document.getElementById('status').className = 'status active';
+               document.getElementById('status').textContent = 'Active';
+           });
+       }
+       
+       function stopGenerator() {
+           fetch('/api/control', {
+               method: 'POST',
+               headers: {
+                   'Authorization': 'Basic ' + btoa('admin:admin'),
+                   'Content-Type': 'application/json'
+               },
+               body: JSON.stringify({action: 'stop'})
+           }).then(() => {
+               document.getElementById('status').className = 'status inactive';
+               document.getElementById('status').textContent = 'Inactive';
+           });
+       }
+       
+       function toggleAutopilot() {
+           fetch('/api/control', {
+               method: 'POST',
+               headers: {
+                   'Authorization': 'Basic ' + btoa('admin:admin'),
+                   'Content-Type': 'application/json'
+               },
+               body: JSON.stringify({action: 'toggle_autopilot'})
+           }).then(() => {
+               const status = document.getElementById('autopilot-status');
+               if (status.textContent.includes('OFF')) {
+                   status.textContent = 'Autopilot: ON';
+                   status.className = 'status active';
+               } else {
+                   status.textContent = 'Autopilot: OFF';
+                   status.className = 'status inactive';
+               }
+           });
+       }
+       
+       function uploadManual() {
+           const numbers = document.getElementById('manual-numbers').value;
+           // Implementation for manual upload
+       }
+       
+       // Initialize
+       initChart();
+       setInterval(updateStats, 2000);
+       
+       // Handle file upload
+       document.getElementById('upload-form').addEventListener('submit', function(e) {
+           e.preventDefault();
+           const fileInput = document.getElementById('csv-file');
+           const file = fileInput.files[0];
+           
+           if (file) {
+               const formData = new FormData();
+               formData.append('csv', file);
+               
+               fetch('/api/numbers', {
+                   method: 'POST',
+                   headers: {
+                       'Authorization': 'Basic ' + btoa('admin:admin')
+                   },
+                   body: formData
+               }).then(() => {
+                   alert('Numbers uploaded successfully!');
+                   fileInput.value = '';
+               });
+           }
+       });
+   </script>
+</body>
+</html>
+`
+EOF
+
+# Update the main generator to use enhanced version
+mv internal/generator/generator.go internal/generator/generator_old.go
+mv internal/generator/enhanced_generator.go internal/generator/generator.go
+
+# Update main.go to include web server
+cat > cmd/callgen/main.go << 'EOF'
+package main
+
+import (
+   "flag"
+   "log"
+   "os"
+   "os/signal"
+   "syscall"
+   
+   "github.com/s1-callgen/internal/config"
+   "github.com/s1-callgen/internal/generator"
+   "github.com/s1-callgen/internal/web"
+)
+
+func main() {
+   var (
+       configFile = flag.String("config", "configs/config.json", "Configuration file")
+       csvFile    = flag.String("csv", "", "CSV file with number pairs")
+       webOnly    = flag.Bool("web", false, "Start only web interface")
+   )
+   flag.Parse()
+   
+   log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+   log.Println("S1 Call Generator starting...")
+   
+   // Load configuration
+   cfg, err := config.LoadConfig(*configFile)
+   if err != nil {
+       log.Fatalf("Failed to load config: %v", err)
+   }
+   
+   // Create generator
+   gen, err := generator.NewGenerator(cfg)
+   if err != nil {
+       log.Fatalf("Failed to create generator: %v", err)
+   }
+   
+   // Load numbers
+   if *csvFile != "" {
+       if err := gen.LoadNumbersFromCSV(*csvFile); err != nil {
+           log.Fatalf("Failed to load CSV: %v", err)
+       }
+   } else {
+       log.Println("No CSV provided, using test numbers")
+       gen.LoadTestNumbers()
+   }
+   
+   // Start web interface if enabled
+   if cfg.WebInterface.Enabled {
+       webServer := web.NewWebServer(cfg, gen)
+       go func() {
+           if err := webServer.Start(); err != nil {
+               log.Printf("Web server error: %v", err)
+           }
+       }()
+   }
+   
+   // Start generator if not web-only mode
+   if !*webOnly {
+       if err := gen.Start(); err != nil {
+           log.Fatalf("Failed to start generator: %v", err)
+       }
+   }
+   
+   // Wait for interrupt
+   sigChan := make(chan os.Signal, 1)
+   signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+   <-sigChan
+   
+   log.Println("Shutting down...")
+   if !*webOnly {
+       gen.Stop()
+   }
+}
+EOF
+
+# Create enhanced configuration with all parameters
+cat > configs/config.json << 'EOF'
+{
+   "s2_server": {
+       "host": "10.0.0.2",
+       "port": 5060
+   },
+   "call_params": {
+       "acd_min": 30,
+       "acd_max": 180,
+       "asr": 70.0,
+       "min_concurrent": 10,
+       "max_concurrent": 100,
+       "calls_per_second": 2.0,
+       "ramp_up_time": 300,
+       "ramp_down_time": 300,
+       "ramp_up_rate": 10,
+       "ramp_down_rate": 10
+   },
+   "schedule": {
+       "enabled": true,
+       "weekday": {
+           "start_hour": 8,
+           "end_hour": 18
+       },
+       "weekend": {
+           "start_hour": 10,
+           "end_hour": 14
+       }
+   },
+   "autopilot": {
+       "enabled": false,
+       "target_asr": 70.0,
+       "adjustment_interval": 60,
+       "max_cps_adjustment": 0.5
+   },
+   "web_interface": {
+       "enabled": true,
+       "port": 8080,
+       "auth": {
+           "username": "admin",
+           "password": "admin"
+       }
+   }
+}
+EOF
+
+# Create CSV with more realistic data
+cat > configs/numbers.csv << 'EOF'
+ANI,DNIS,Country,Carrier
+19543004835,50764137984,US,Verizon
+19543004836,50764137985,US,AT&T
+19543004837,50764137986,US,T-Mobile
+19543004838,50764137987,US,Sprint
+19543004839,50764137988,US,Verizon
+19543004840,50764137989,US,AT&T
+19543004841,50764137990,US,T-Mobile
+19543004842,50764137991,US,Sprint
+19543004843,50764137992,US,Verizon
+19543004844,50764137993,US,AT&T
+12125551234,14155551234,US,Verizon
+13105551234,17185551234,US,AT&T
+16465551234,19725551234,US,T-Mobile
+17735551234,12145551234,US,Sprint
+18185551234,13035551234,US,Verizon
+EOF
+
+# Build the enhanced generator
+go mod tidy
+go build -o bin/callgen cmd/callgen/main.go
+
+echo "Enhanced S1 Call Generator built successfully!"
+EOF
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

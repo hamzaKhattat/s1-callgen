@@ -9,16 +9,17 @@ import (
    
    "github.com/s1-callgen/internal/config"
    "github.com/s1-callgen/internal/generator"
+   "github.com/s1-callgen/internal/web"
 )
 
 func main() {
    var (
        configFile = flag.String("config", "configs/config.json", "Configuration file")
        csvFile    = flag.String("csv", "", "CSV file with number pairs")
+       webOnly    = flag.Bool("web", false, "Start only web interface")
    )
    flag.Parse()
    
-   // Setup logging
    log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
    log.Println("S1 Call Generator starting...")
    
@@ -40,14 +41,25 @@ func main() {
            log.Fatalf("Failed to load CSV: %v", err)
        }
    } else {
-       // Use default test numbers
        log.Println("No CSV provided, using test numbers")
        gen.LoadTestNumbers()
    }
    
-   // Start generation
-   if err := gen.Start(); err != nil {
-       log.Fatalf("Failed to start generator: %v", err)
+   // Start web interface if enabled
+   if cfg.WebInterface.Enabled {
+       webServer := web.NewWebServer(cfg, gen)
+       go func() {
+           if err := webServer.Start(); err != nil {
+               log.Printf("Web server error: %v", err)
+           }
+       }()
+   }
+   
+   // Start generator if not web-only mode
+   if !*webOnly {
+       if err := gen.Start(); err != nil {
+           log.Fatalf("Failed to start generator: %v", err)
+       }
    }
    
    // Wait for interrupt
@@ -56,5 +68,7 @@ func main() {
    <-sigChan
    
    log.Println("Shutting down...")
-   gen.Stop()
+   if !*webOnly {
+       gen.Stop()
+   }
 }

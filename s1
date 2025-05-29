@@ -1,3 +1,10 @@
+#!/bin/bash
+# Fix S1 Call Generator compilation errors
+
+cd /home/car/s1-callgen
+
+# Fix generator.go imports and struct issues
+cat > internal/generator/generator.go << 'EOF'
 package generator
 
 import (
@@ -273,3 +280,146 @@ func getLocalIP() string {
     
     return "10.0.0.1"
 }
+EOF
+
+# Fix the RTP module to include fmt import
+cat > internal/sip/rtp.go << 'EOF'
+package sip
+
+import (
+    "encoding/binary"
+    "fmt"
+    "math/rand"
+    "net"
+    "time"
+)
+
+type RTPPacket struct {
+    Version        uint8
+    Padding        bool
+    Extension      bool
+    CSRCCount      uint8
+    Marker         bool
+    PayloadType    uint8
+    SequenceNumber uint16
+    Timestamp      uint32
+    SSRC           uint32
+    Payload        []byte
+}
+
+func SendRTPStream(localIP string, localPort int, remoteIP string, remotePort int, duration time.Duration) error {
+    conn, err := net.Dial("udp", fmt.Sprintf("%s:%d", remoteIP, remotePort))
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
+    
+    // RTP parameters
+    ssrc := uint32(rand.Int31())
+    sequenceNumber := uint16(rand.Intn(65535))
+    timestamp := uint32(rand.Int31())
+    
+    // Send RTP packets (50 packets per second for 20ms intervals)
+    ticker := time.NewTicker(20 * time.Millisecond)
+    defer ticker.Stop()
+    
+    timeout := time.After(duration)
+    
+    for {
+        select {
+        case <-ticker.C:
+            packet := createRTPPacket(sequenceNumber, timestamp, ssrc)
+            conn.Write(packet)
+            sequenceNumber++
+            timestamp += 160 // 160 samples at 8kHz for 20ms
+        case <-timeout:
+            return nil
+        }
+    }
+}
+
+func createRTPPacket(seq uint16, ts uint32, ssrc uint32) []byte {
+    packet := make([]byte, 12+160) // RTP header + 160 bytes of audio
+    
+    // RTP header
+    packet[0] = 0x80 // Version 2, no padding, no extension, no CSRC
+    packet[1] = 0    // Marker = 0, Payload type = 0 (PCMU)
+    
+    binary.BigEndian.PutUint16(packet[2:4], seq)
+    binary.BigEndian.PutUint32(packet[4:8], ts)
+    binary.BigEndian.PutUint32(packet[8:12], ssrc)
+    
+    // Fill with silence (0xFF for PCMU)
+    for i := 12; i < len(packet); i++ {
+        packet[i] = 0xFF
+    }
+    
+    return packet
+}
+EOF
+
+# Now rebuild the S1 project
+echo "Rebuilding S1 Call Generator..."
+go mod tidy
+make build
+
+if [ $? -eq 0 ]; then
+    echo "S1 Call Generator built successfully!"
+else
+    echo "Build failed, trying direct compilation..."
+    go build -o bin/callgen cmd/callgen/main.go
+fi
+
+# Create a test runner script
+cat > run_s1_test.sh << 'EOF'
+#!/bin/bash
+
+echo "Starting S1 Call Generator Test..."
+
+# Check if S2 is reachable
+if ! nc -z 10.0.0.2 5060 2>/dev/null; then
+    echo "Error: S2 (10.0.0.2:5060) is not reachable"
+    exit 1
+fi
+
+# Start with test configuration
+cd /home/car/s1-callgen
+
+# Create a test config with lower call rate
+cat > configs/test_config.json << 'JSON'
+{
+    "s2_server": {
+        "host": "10.0.0.2",
+        "port": 5060
+    },
+    "call_params": {
+        "acd_min": 10,
+        "acd_max": 30,
+        "asr": 80.0,
+        "max_concurrent": 5,
+        "calls_per_second": 0.5,
+        "ramp_up_time": 10,
+        "ramp_down_time": 10
+    },
+    "schedule": {
+        "weekday": {
+            "start_hour": 0,
+            "end_hour": 24
+        },
+        "weekend": {
+            "start_hour": 0,
+            "end_hour": 24
+        }
+    }
+}
+JSON
+
+# Run the generator
+./bin/callgen -config configs/test_config.json -csv configs/numbers.csv
+EOF
+
+chmod +x run_s1_test.sh
+
+echo "S1 Call Generator fixed and ready!"
+echo "To run a test: ./run_s1_test.sh"
+EOF
